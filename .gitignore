@@ -5,6 +5,9 @@
 data/
 masks/
 seg-lungs/
+subset*/
+*.mhd
+*.raw
 
 # Модели
 *.pth
