@@ -76,13 +76,21 @@ def main():
         # Ищем узелки для этого снимка
         nodules = df[df['seriesuid'] == series_uid]
 
-        if len(nodules) == 0:
-            skipped += 1
-            continue
-
         # Пропускаем если маска уже существует
         out_path = os.path.join(OUTPUT_MASK_DIR, f"{series_uid}_mask.mhd")
         if os.path.exists(out_path):
+            created += 1
+            continue
+
+        if len(nodules) == 0:
+            # Пустая маска для негативных сканов (важно для обучения!)
+            img_path = os.path.join(img_dir, file)
+            itk_img = sitk.ReadImage(img_path)
+            img_array = sitk.GetArrayFromImage(itk_img)
+            mask_array = np.zeros_like(img_array, dtype=np.uint8)
+            mask_itk = sitk.GetImageFromArray(mask_array)
+            mask_itk.CopyInformation(itk_img)
+            sitk.WriteImage(mask_itk, out_path)
             created += 1
             continue
 
@@ -136,7 +144,7 @@ def main():
         sitk.WriteImage(mask_itk, out_path)
         created += 1
 
-    print(f"\nГотово! Создано масок: {created}, пропущено (нет узелков): {skipped}")
+    print(f"\nГотово! Создано масок: {created} (включая пустые для негативных сканов), пропущено: {skipped}")
 
 
 if __name__ == "__main__":

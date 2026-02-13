@@ -23,14 +23,13 @@ import numpy as np
 from tqdm import tqdm
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged,
-    SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
+    Spacingd, SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
+    RandGaussianNoised, RandScaleIntensityd, RandShiftIntensityd,
 )
 import itk  # noqa: F401 — нужен для MONAI ITKReader
 from monai.data import CacheDataset, DataLoader, list_data_collate
 from monai.networks.nets import UNet
-from monai.losses import DiceLoss
-from monai.metrics import DiceMetric
-from monai.inferers import sliding_window_inference
+from monai.losses import DiceFocalLoss
 
 
 def main():
@@ -43,7 +42,7 @@ def main():
     MODEL_SAVE_PATH = os.path.join(BASE_DIR, "luna16_unet.pth")
 
     LEARNING_RATE = 1e-4
-    VAL_INTERVAL = 2   # Валидация каждые N эпох (sliding_window — дорогая операция)
+    SAVE_INTERVAL = 10  # Сохранение модели каждые N эпох
 
     # =========================================================================
     # УСТРОЙСТВО — CUDA первым приоритетом
@@ -77,25 +76,25 @@ def main():
 
         # Параметры масштабируются под СУММАРНУЮ GPU-память
         if total_gpu_mem >= 20:     # 2x RTX 4070 = 24 GB / A100 / etc.
-            MAX_EPOCHS = 50
+            MAX_EPOCHS = 80
             BATCH_SIZE = 3 * num_gpus   # 3 на GPU — ~8-9ГБ из 11.6ГБ, с запасом
             ACCUM_STEPS = 1             # Без accumulation
             PATCH_SIZE = (128, 128, 128)
-            NUM_SAMPLES = 4
+            NUM_SAMPLES = 6
             NUM_WORKERS = 4
             CHANNELS = (32, 64, 128, 256, 512)
             STRIDES = (2, 2, 2, 2)
         elif total_gpu_mem >= 8:
-            MAX_EPOCHS = 30
+            MAX_EPOCHS = 60
             BATCH_SIZE = 2 * num_gpus
             ACCUM_STEPS = 1
             PATCH_SIZE = (96, 96, 96)
-            NUM_SAMPLES = 4
+            NUM_SAMPLES = 6
             NUM_WORKERS = 4
             CHANNELS = (16, 32, 64, 128, 256)
             STRIDES = (2, 2, 2, 2)
         else:
-            MAX_EPOCHS = 20
+            MAX_EPOCHS = 40
             BATCH_SIZE = 1 * num_gpus
             ACCUM_STEPS = 1
             PATCH_SIZE = (64, 64, 64)
@@ -135,12 +134,11 @@ def main():
         print("Сначала запусти: python prepare_masks.py")
         return
 
-    # Разделение: 80% train / 20% validation
-    split = max(1, int(len(data_dicts) * 0.8))
-    train_dicts = data_dicts[:split]
-    val_dicts = data_dicts[split:]
-    print(f"Найдено {len(data_dicts)} снимков с узелками")
-    print(f"  Train: {len(train_dicts)}, Val: {len(val_dicts)}")
+    # Обучение на ВСЕХ данных (без val-split) — максимум детекции
+    np.random.seed(42)
+    np.random.shuffle(data_dicts)
+    train_dicts = data_dicts
+    print(f"Обучение на ВСЕХ {len(train_dicts)} снимках (без val-split)")
 
     # =========================================================================
     # ТРАНСФОРМАЦИИ
@@ -148,6 +146,10 @@ def main():
     train_transforms = Compose([
         LoadImaged(keys=["image", "label"], reader="ITKReader"),
         EnsureChannelFirstd(keys=["image", "label"]),
+
+        # Изотропный ресамплинг 1мм — критично при разном slice thickness
+        Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0),
+                 mode=("bilinear", "nearest")),
 
         # Нормализация КТ Hounsfield Units → [0, 1]
         ScaleIntensityRanged(
@@ -160,46 +162,36 @@ def main():
         # Паддинг до минимального размера патча (если скан меньше)
         SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
 
-        # Вырезаем 3D-патчи (весь скан не влезет в GPU)
+        # Вырезаем 3D-патчи: pos=3/neg=1 — акцент на узелки
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
             spatial_size=PATCH_SIZE,
-            pos=1, neg=1,
+            pos=3, neg=1,
             num_samples=NUM_SAMPLES,
             image_key="image",
             image_threshold=0,
             allow_smaller=True,
         ),
 
-        # Аугментации
+        # Геометрические аугментации
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
         RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
-    ])
 
-    val_transforms = Compose([
-        LoadImaged(keys=["image", "label"], reader="ITKReader"),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        ScaleIntensityRanged(
-            keys=["image"],
-            a_min=-1000, a_max=400,
-            b_min=0.0, b_max=1.0,
-            clip=True,
-        ),
+        # Интенсивностные аугментации (только image)
+        RandGaussianNoised(keys=["image"], prob=0.3, mean=0.0, std=0.05),
+        RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
+        RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
     ])
 
     # =========================================================================
-    # ДАТАСЕТЫ И ЛОАДЕРЫ — CacheDataset кэширует снимки в RAM
+    # ДАТАСЕТ И ЛОАДЕР — CacheDataset кэширует снимки в RAM
     # =========================================================================
     print("Кэширование данных в RAM (первый запуск может занять несколько минут)...")
     train_ds = CacheDataset(
         data=train_dicts, transform=train_transforms,
-        cache_rate=0.2, num_workers=NUM_WORKERS,   # Снижен cache_rate чтобы не взрывать RAM
-    )
-    val_ds = CacheDataset(
-        data=val_dicts, transform=val_transforms,
         cache_rate=0.3, num_workers=NUM_WORKERS,
     )
 
@@ -209,15 +201,6 @@ def main():
         shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=list_data_collate,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=3 if NUM_WORKERS > 0 else None,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(NUM_WORKERS > 0),
         prefetch_factor=3 if NUM_WORKERS > 0 else None,
@@ -233,7 +216,7 @@ def main():
         channels=CHANNELS,
         strides=STRIDES,
         num_res_units=2,
-        dropout=0.2,
+        dropout=0.1,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -244,11 +227,16 @@ def main():
         model = nn.DataParallel(model)
         print(f"✓  DataParallel: модель на {num_gpus} GPU")
 
-    # Loss и Optimizer
-    loss_function = DiceLoss(to_onehot_y=True, softmax=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * num_gpus, weight_decay=1e-5)
+    # Loss — DiceFocalLoss: Dice для перекрытия + Focal для мелких узелков
+    loss_function = DiceFocalLoss(
+        to_onehot_y=True, softmax=True,
+        include_background=False,
+        gamma=2.0,
+        lambda_dice=1.0,
+        lambda_focal=2.0,   # Усиленный Focal для редкого foreground
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * max(num_gpus, 1), weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
 
     # AMP (Mixed Precision) — ускорение на GPU
     use_amp = torch.cuda.is_available()
@@ -257,11 +245,11 @@ def main():
     # =========================================================================
     # ЦИКЛ ОБУЧЕНИЯ
     # =========================================================================
-    best_metric = -1.0
+    best_loss = float("inf")
 
     print(f"\n{'='*60}")
-    print(f"Начинаем обучение: {MAX_EPOCHS} эпох")
-    print(f"Валидация каждые {VAL_INTERVAL} эпох")
+    print(f"Начинаем обучение: {MAX_EPOCHS} эпох (все данные, без val)")
+    print(f"Сохранение каждые {SAVE_INTERVAL} эпох")
     print(f"Mixed Precision (AMP): {'Да' if use_amp else 'Нет'}")
     print(f"{'='*60}\n")
 
@@ -322,52 +310,32 @@ def main():
         scheduler.step()
         lr_now = optimizer.param_groups[0]['lr']
 
-        # === VALIDATION (каждые VAL_INTERVAL эпох) ===
-        metric = -1.0
-        if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == MAX_EPOCHS:
-            model.eval()
-            # Для sliding_window нужна базовая модель (без DataParallel)
-            raw_model = model.module if hasattr(model, 'module') else model
-            with torch.no_grad():
-                val_pbar = tqdm(val_loader, desc=f"[Val   {epoch+1}/{MAX_EPOCHS}]",
-                                unit="scan", leave=True, dynamic_ncols=True)
-                for val_data in val_pbar:
-                    val_inputs = val_data["image"].to(device, non_blocking=True)
-                    val_labels = val_data["label"].to(device, non_blocking=True)
+        # === ЛОГИРОВАНИЕ И СОХРАНЕНИЕ ===
+        elapsed = time.time() - epoch_start
+        print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS}: "
+              f"Loss={avg_loss:.4f} | LR={lr_now:.2e} | Время: {elapsed:.1f}с")
 
-                    with torch.amp.autocast("cuda", enabled=use_amp):
-                        val_outputs = sliding_window_inference(
-                            val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
-                        )
+        # Периодическое сохранение + финальная эпоха
+        if (epoch + 1) % SAVE_INTERVAL == 0 or (epoch + 1) == MAX_EPOCHS:
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            save_path = MODEL_SAVE_PATH.replace(".pth", f"_ep{epoch+1}.pth")
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": state_dict,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg_loss,
+            }, save_path)
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": state_dict,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg_loss,
+            }, MODEL_SAVE_PATH)
+            print(f"  ★ Модель сохранена: {os.path.basename(save_path)}")
 
-                    val_outputs_onehot = torch.argmax(val_outputs, dim=1, keepdim=True)
-                    val_labels_onehot = (val_labels > 0).long()
-                    dice_metric(y_pred=val_outputs_onehot, y=val_labels_onehot)
-
-                metric = dice_metric.aggregate().item()
-                dice_metric.reset()
-
-            elapsed = time.time() - epoch_start
-            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
-                  f"Loss={avg_loss:.4f} | Dice={metric:.4f} | "
-                  f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
-
-            # Сохраняем лучшую модель
-            if metric > best_metric:
-                best_metric = metric
-                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-                torch.save({
-                    "epoch": epoch + 1,
-                    "model_state_dict": state_dict,
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_dice": best_metric,
-                }, MODEL_SAVE_PATH)
-                print(f"  ★ Лучшая модель сохранена (Dice: {best_metric:.4f})")
-        else:
-            elapsed = time.time() - epoch_start
-            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
-                  f"Loss={avg_loss:.4f} | Val: пропущена (след. на эпохе {((epoch+1)//VAL_INTERVAL+1)*VAL_INTERVAL}) | "
-                  f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
+        # Отслеживание лучшего loss
+        if avg_loss < best_loss:
+            best_loss = avg_loss
 
         # Очистка GPU-кэша
         if torch.cuda.is_available():
@@ -378,7 +346,7 @@ def main():
     # =========================================================================
     print(f"\n{'='*60}")
     print(f"Обучение завершено!")
-    print(f"Лучший Dice на валидации: {best_metric:.4f}")
+    print(f"Лучший Loss: {best_loss:.4f}")
     print(f"Модель сохранена: {MODEL_SAVE_PATH}")
 
     if torch.cuda.is_available():
