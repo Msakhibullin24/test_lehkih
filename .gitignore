@@ -1,0 +1,38 @@
+# Виртуальное окружение
+.venv/
+
+# Данные (слишком большие для git)
+data/
+masks/
+seg-lungs/
+
+# Модели
+*.pth
+
+# CSV-данные (большие)
+annotations.csv
+candidates.csv
+candidates_V2.zip
+sampleSubmission.csv
+
+# Архивы с данными
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
