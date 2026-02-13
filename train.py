@@ -26,10 +26,13 @@ from monai.transforms import (
     Spacingd, SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
     RandGaussianNoised, RandScaleIntensityd, RandShiftIntensityd,
 )
+import SimpleITK as sitk
 import itk  # noqa: F401 — нужен для MONAI ITKReader
 from monai.data import CacheDataset, DataLoader, list_data_collate
 from monai.networks.nets import UNet
 from monai.losses import DiceFocalLoss
+from monai.metrics import DiceMetric
+from monai.inferers import sliding_window_inference
 
 
 def main():
@@ -42,6 +45,7 @@ def main():
     MODEL_SAVE_PATH = os.path.join(BASE_DIR, "luna16_unet.pth")
 
     LEARNING_RATE = 1e-4
+    VAL_INTERVAL = 2    # Валидация каждые N эпох
     SAVE_INTERVAL = 10  # Сохранение модели каждые N эпох
 
     # =========================================================================
@@ -121,24 +125,49 @@ def main():
           f"{[os.path.basename(d) for d in subset_dirs]}")
 
     data_dicts = []
+    positive_dicts = []  # Сканы С узелками
+    negative_dicts = []  # Сканы БЕЗ узелков (пустые маски)
+
     for sdir in subset_dirs:
         images = sorted(glob.glob(os.path.join(sdir, "*.mhd")))
         for img_path in images:
             uid = os.path.basename(img_path).replace(".mhd", "")
             mask_path = os.path.join(MASK_DIR, f"{uid}_mask.mhd")
             if os.path.exists(mask_path):
-                data_dicts.append({"image": img_path, "label": mask_path})
+                # Быстрая проверка: есть ли хоть один foreground-воксель
+                mask_img = sitk.ReadImage(mask_path)
+                mask_arr = sitk.GetArrayFromImage(mask_img)
+                entry = {"image": img_path, "label": mask_path}
+                if mask_arr.max() > 0:
+                    positive_dicts.append(entry)
+                else:
+                    negative_dicts.append(entry)
 
-    if not data_dicts:
-        print("ОШИБКА: Не найдено пар (снимок, маска)!")
+    print(f"Позитивных сканов (с узелками): {len(positive_dicts)}")
+    print(f"Негативных сканов (без узелков): {len(negative_dicts)}")
+
+    if not positive_dicts:
+        print("ОШИБКА: Не найдено сканов с узелками!")
         print("Сначала запусти: python prepare_masks.py")
         return
 
-    # Обучение на ВСЕХ данных (без val-split) — максимум детекции
+    # Ограничиваем негативные: не более 30% от позитивных
+    # Это учит модель не галлюцинировать, но не заливает обучение пустотой
+    max_neg = max(1, int(len(positive_dicts) * 0.3))
     np.random.seed(42)
+    np.random.shuffle(negative_dicts)
+    selected_neg = negative_dicts[:max_neg]
+
+    data_dicts = positive_dicts + selected_neg
     np.random.shuffle(data_dicts)
-    train_dicts = data_dicts
-    print(f"Обучение на ВСЕХ {len(train_dicts)} снимках (без val-split)")
+
+    # Разделение: 80% train / 20% validation
+    split = max(1, int(len(data_dicts) * 0.8))
+    train_dicts = data_dicts[:split]
+    val_dicts = data_dicts[split:]
+    print(f"Итого: {len(data_dicts)} "
+          f"({len(positive_dicts)} позитивных + {len(selected_neg)} негативных)")
+    print(f"  Train: {len(train_dicts)}, Val: {len(val_dicts)}")
 
     # =========================================================================
     # ТРАНСФОРМАЦИИ
@@ -186,13 +215,30 @@ def main():
         RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
     ])
 
+    val_transforms = Compose([
+        LoadImaged(keys=["image", "label"], reader="ITKReader"),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0),
+                 mode=("bilinear", "nearest")),
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=-1000, a_max=400,
+            b_min=0.0, b_max=1.0,
+            clip=True,
+        ),
+    ])
+
     # =========================================================================
-    # ДАТАСЕТ И ЛОАДЕР — CacheDataset кэширует снимки в RAM
+    # ДАТАСЕТЫ И ЛОАДЕРЫ — CacheDataset кэширует снимки в RAM
     # =========================================================================
     print("Кэширование данных в RAM (первый запуск может занять несколько минут)...")
     train_ds = CacheDataset(
         data=train_dicts, transform=train_transforms,
         cache_rate=0.3, num_workers=NUM_WORKERS,
+    )
+    val_ds = CacheDataset(
+        data=val_dicts, transform=val_transforms,
+        cache_rate=0.5, num_workers=NUM_WORKERS,
     )
 
     train_loader = DataLoader(
@@ -201,6 +247,14 @@ def main():
         shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=3 if NUM_WORKERS > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(NUM_WORKERS > 0),
         prefetch_factor=3 if NUM_WORKERS > 0 else None,
@@ -237,6 +291,7 @@ def main():
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * max(num_gpus, 1), weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
 
     # AMP (Mixed Precision) — ускорение на GPU
     use_amp = torch.cuda.is_available()
@@ -245,10 +300,11 @@ def main():
     # =========================================================================
     # ЦИКЛ ОБУЧЕНИЯ
     # =========================================================================
-    best_loss = float("inf")
+    best_metric = -1.0
 
     print(f"\n{'='*60}")
-    print(f"Начинаем обучение: {MAX_EPOCHS} эпох (все данные, без val)")
+    print(f"Начинаем обучение: {MAX_EPOCHS} эпох")
+    print(f"Валидация каждые {VAL_INTERVAL} эпох")
     print(f"Сохранение каждые {SAVE_INTERVAL} эпох")
     print(f"Mixed Precision (AMP): {'Да' if use_amp else 'Нет'}")
     print(f"{'='*60}\n")
@@ -310,13 +366,62 @@ def main():
         scheduler.step()
         lr_now = optimizer.param_groups[0]['lr']
 
-        # === ЛОГИРОВАНИЕ И СОХРАНЕНИЕ ===
-        elapsed = time.time() - epoch_start
-        print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS}: "
-              f"Loss={avg_loss:.4f} | LR={lr_now:.2e} | Время: {elapsed:.1f}с")
+        # === VALIDATION (каждые VAL_INTERVAL эпох) ===
+        metric_val = -1.0
+        if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == MAX_EPOCHS:
+            model.eval()
+            raw_model = model.module if hasattr(model, 'module') else model
+            with torch.no_grad():
+                val_pbar = tqdm(val_loader, desc=f"[Val   {epoch+1}/{MAX_EPOCHS}]",
+                                unit="scan", leave=True, dynamic_ncols=True)
+                for val_data in val_pbar:
+                    val_inputs = val_data["image"].to(device, non_blocking=True)
+                    val_labels = val_data["label"].to(device, non_blocking=True)
 
-        # Периодическое сохранение + финальная эпоха
-        if (epoch + 1) % SAVE_INTERVAL == 0 or (epoch + 1) == MAX_EPOCHS:
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        val_outputs = sliding_window_inference(
+                            val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
+                        )
+
+                    # One-hot предсказания для DiceMetric
+                    val_pred = torch.argmax(val_outputs, dim=1, keepdim=True)
+                    num_classes = val_outputs.shape[1]
+                    val_pred_onehot = torch.nn.functional.one_hot(
+                        val_pred.squeeze(1).long(), num_classes
+                    ).permute(0, 4, 1, 2, 3).float()
+                    val_labels_onehot = torch.nn.functional.one_hot(
+                        val_labels.squeeze(1).long(), num_classes
+                    ).permute(0, 4, 1, 2, 3).float()
+                    dice_metric(y_pred=val_pred_onehot, y=val_labels_onehot)
+
+                metric_val = dice_metric.aggregate().item()
+                dice_metric.reset()
+
+            elapsed = time.time() - epoch_start
+            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS}: "
+                  f"Loss={avg_loss:.4f} | Dice={metric_val:.4f} | "
+                  f"LR={lr_now:.2e} | Время: {elapsed:.1f}с")
+
+            # Сохраняем лучшую модель по Dice
+            if metric_val > best_metric:
+                best_metric = metric_val
+                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": state_dict,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_dice": best_metric,
+                    "loss": avg_loss,
+                }, MODEL_SAVE_PATH)
+                print(f"  ★ Лучшая модель сохранена (Dice: {best_metric:.4f})")
+        else:
+            elapsed = time.time() - epoch_start
+            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS}: "
+                  f"Loss={avg_loss:.4f} | Val: следующая на эп. {((epoch+1)//VAL_INTERVAL+1)*VAL_INTERVAL} | "
+                  f"LR={lr_now:.2e} | Время: {elapsed:.1f}с")
+
+        # Периодическое сохранение чекпоинтов
+        if (epoch + 1) % SAVE_INTERVAL == 0:
             state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
             save_path = MODEL_SAVE_PATH.replace(".pth", f"_ep{epoch+1}.pth")
             torch.save({
@@ -324,18 +429,9 @@ def main():
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": avg_loss,
+                "dice": metric_val,
             }, save_path)
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": state_dict,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": avg_loss,
-            }, MODEL_SAVE_PATH)
-            print(f"  ★ Модель сохранена: {os.path.basename(save_path)}")
-
-        # Отслеживание лучшего loss
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+            print(f"  📁 Чекпоинт: {os.path.basename(save_path)}")
 
         # Очистка GPU-кэша
         if torch.cuda.is_available():
@@ -346,7 +442,7 @@ def main():
     # =========================================================================
     print(f"\n{'='*60}")
     print(f"Обучение завершено!")
-    print(f"Лучший Loss: {best_loss:.4f}")
+    print(f"Лучший Dice на валидации: {best_metric:.4f}")
     print(f"Модель сохранена: {MODEL_SAVE_PATH}")
 
     if torch.cuda.is_available():
