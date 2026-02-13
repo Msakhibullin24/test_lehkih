@@ -125,48 +125,32 @@ def main():
           f"{[os.path.basename(d) for d in subset_dirs]}")
 
     data_dicts = []
-    positive_dicts = []  # Сканы С узелками
-    negative_dicts = []  # Сканы БЕЗ узелков (пустые маски)
-
     for sdir in subset_dirs:
         images = sorted(glob.glob(os.path.join(sdir, "*.mhd")))
         for img_path in images:
             uid = os.path.basename(img_path).replace(".mhd", "")
             mask_path = os.path.join(MASK_DIR, f"{uid}_mask.mhd")
             if os.path.exists(mask_path):
-                # Быстрая проверка: есть ли хоть один foreground-воксель
+                # Берём только сканы с узелками (foreground > 0)
                 mask_img = sitk.ReadImage(mask_path)
                 mask_arr = sitk.GetArrayFromImage(mask_img)
-                entry = {"image": img_path, "label": mask_path}
                 if mask_arr.max() > 0:
-                    positive_dicts.append(entry)
-                else:
-                    negative_dicts.append(entry)
+                    data_dicts.append({"image": img_path, "label": mask_path})
 
-    print(f"Позитивных сканов (с узелками): {len(positive_dicts)}")
-    print(f"Негативных сканов (без узелков): {len(negative_dicts)}")
+    print(f"Сканов с узелками: {len(data_dicts)}")
 
-    if not positive_dicts:
+    if not data_dicts:
         print("ОШИБКА: Не найдено сканов с узелками!")
         print("Сначала запусти: python prepare_masks.py")
         return
 
-    # Ограничиваем негативные: не более 30% от позитивных
-    # Это учит модель не галлюцинировать, но не заливает обучение пустотой
-    max_neg = max(1, int(len(positive_dicts) * 0.3))
     np.random.seed(42)
-    np.random.shuffle(negative_dicts)
-    selected_neg = negative_dicts[:max_neg]
-
-    data_dicts = positive_dicts + selected_neg
     np.random.shuffle(data_dicts)
 
     # Разделение: 80% train / 20% validation
     split = max(1, int(len(data_dicts) * 0.8))
     train_dicts = data_dicts[:split]
     val_dicts = data_dicts[split:]
-    print(f"Итого: {len(data_dicts)} "
-          f"({len(positive_dicts)} позитивных + {len(selected_neg)} негативных)")
     print(f"  Train: {len(train_dicts)}, Val: {len(val_dicts)}")
 
     # =========================================================================
