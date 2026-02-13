@@ -20,6 +20,7 @@ import time
 import torch
 import torch.nn as nn
 import numpy as np
+from tqdm import tqdm
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged,
     SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
@@ -78,7 +79,7 @@ def main():
             BATCH_SIZE = 4 * num_gpus   # 4 на каждый GPU
             PATCH_SIZE = (128, 128, 128)
             NUM_SAMPLES = 4
-            NUM_WORKERS = 4 * num_gpus  # 4 воркера на GPU
+            NUM_WORKERS = 4              # Ограничиваем воркеры чтобы не дублировать кеш в RAM
             CHANNELS = (32, 64, 128, 256, 512)
             STRIDES = (2, 2, 2, 2)
         elif total_gpu_mem >= 8:
@@ -86,7 +87,7 @@ def main():
             BATCH_SIZE = 2 * num_gpus
             PATCH_SIZE = (96, 96, 96)
             NUM_SAMPLES = 4
-            NUM_WORKERS = 4 * num_gpus
+            NUM_WORKERS = 4
             CHANNELS = (16, 32, 64, 128, 256)
             STRIDES = (2, 2, 2, 2)
         else:
@@ -190,11 +191,11 @@ def main():
     print("Кэширование данных в RAM (первый запуск может занять несколько минут)...")
     train_ds = CacheDataset(
         data=train_dicts, transform=train_transforms,
-        cache_rate=0.3, num_workers=NUM_WORKERS,
+        cache_rate=0.2, num_workers=NUM_WORKERS,   # Снижен cache_rate чтобы не взрывать RAM
     )
     val_ds = CacheDataset(
         data=val_dicts, transform=val_transforms,
-        cache_rate=0.5, num_workers=NUM_WORKERS,
+        cache_rate=0.3, num_workers=NUM_WORKERS,
     )
 
     train_loader = DataLoader(
@@ -258,16 +259,32 @@ def main():
     print(f"Mixed Precision (AMP): {'Да' if use_amp else 'Нет'}")
     print(f"{'='*60}\n")
 
+    total_start = time.time()
+
     for epoch in range(MAX_EPOCHS):
         epoch_start = time.time()
-        print(f"--- Эпоха {epoch + 1}/{MAX_EPOCHS} ---")
+        elapsed_total = time.time() - total_start
+        if epoch > 0:
+            avg_epoch_time = elapsed_total / epoch
+            eta = avg_epoch_time * (MAX_EPOCHS - epoch)
+            eta_str = time.strftime('%H:%M:%S', time.gmtime(eta))
+        else:
+            eta_str = '??:??:??'
+
+        print(f"\n{'='*60}")
+        print(f"  Эпоха {epoch + 1}/{MAX_EPOCHS}  |  "
+              f"Прошло: {time.strftime('%H:%M:%S', time.gmtime(elapsed_total))}  |  "
+              f"ETA: {eta_str}")
+        print(f"{'='*60}")
 
         # === TRAIN ===
         model.train()
         epoch_loss = 0.0
         step = 0
 
-        for batch_data in train_loader:
+        train_pbar = tqdm(train_loader, desc=f"[Train {epoch+1}/{MAX_EPOCHS}]",
+                          unit="batch", leave=True, dynamic_ncols=True)
+        for batch_data in train_pbar:
             step += 1
             inputs = batch_data["image"].to(device, non_blocking=True)
             labels = batch_data["label"].to(device, non_blocking=True)
@@ -283,9 +300,8 @@ def main():
             scaler.update()
 
             epoch_loss += loss.item()
-
-            if step % 10 == 0:
-                print(f"  Шаг {step}, Loss: {loss.item():.4f}")
+            avg_so_far = epoch_loss / step
+            train_pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_so_far:.4f}")
 
         avg_loss = epoch_loss / max(step, 1)
         scheduler.step()
@@ -296,7 +312,9 @@ def main():
         # Для sliding_window нужна базовая модель (без DataParallel)
         raw_model = model.module if hasattr(model, 'module') else model
         with torch.no_grad():
-            for val_data in val_loader:
+            val_pbar = tqdm(val_loader, desc=f"[Val   {epoch+1}/{MAX_EPOCHS}]",
+                            unit="scan", leave=True, dynamic_ncols=True)
+            for val_data in val_pbar:
                 val_inputs = val_data["image"].to(device, non_blocking=True)
                 val_labels = val_data["label"].to(device, non_blocking=True)
 
@@ -314,8 +332,9 @@ def main():
 
         elapsed = time.time() - epoch_start
 
-        print(f"  Avg Loss: {avg_loss:.4f} | Val Dice: {metric:.4f} | "
-              f"LR: {lr_now:.2e} | Время: {elapsed:.1f}с")
+        print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
+              f"Loss={avg_loss:.4f} | Dice={metric:.4f} | "
+              f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
 
         # Сохраняем лучшую модель
         if metric > best_metric:
