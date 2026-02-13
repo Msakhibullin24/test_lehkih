@@ -190,11 +190,11 @@ def main():
     print("Кэширование данных в RAM (первый запуск может занять несколько минут)...")
     train_ds = CacheDataset(
         data=train_dicts, transform=train_transforms,
-        cache_rate=0.5, num_workers=NUM_WORKERS,
+        cache_rate=0.3, num_workers=NUM_WORKERS,
     )
     val_ds = CacheDataset(
         data=val_dicts, transform=val_transforms,
-        cache_rate=1.0, num_workers=NUM_WORKERS,
+        cache_rate=0.5, num_workers=NUM_WORKERS,
     )
 
     train_loader = DataLoader(
