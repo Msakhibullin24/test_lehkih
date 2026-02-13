@@ -18,13 +18,14 @@ import os
 import glob
 import time
 import torch
+import torch.nn as nn
 import numpy as np
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged,
     SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
 )
 import itk  # noqa: F401 — нужен для MONAI ITKReader
-from monai.data import Dataset, DataLoader, list_data_collate
+from monai.data import CacheDataset, DataLoader, list_data_collate
 from monai.networks.nets import UNet
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
@@ -48,6 +49,7 @@ def main():
     if not torch.cuda.is_available():
         print("⚠  CUDA не найдена, работаем на CPU (облегчённый режим)")
         device = torch.device("cpu")
+        num_gpus = 0
         MAX_EPOCHS = 3
         BATCH_SIZE = 1
         PATCH_SIZE = (64, 64, 64)
@@ -57,40 +59,46 @@ def main():
         STRIDES = (2, 2, 2)
     else:
         device = torch.device("cuda")
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"✓  CUDA найдена: {gpu_name} ({gpu_mem:.1f} GB)")
+        num_gpus = torch.cuda.device_count()
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-        # Параметры масштабируются под GPU-память
-        if gpu_mem >= 20:       # A100 / RTX 4090 / A6000
+        # Информация обо всех GPU
+        total_gpu_mem = 0.0
+        for i in range(num_gpus):
+            name = torch.cuda.get_device_name(i)
+            mem = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+            total_gpu_mem += mem
+            print(f"✓  GPU {i}: {name} ({mem:.1f} GB)")
+
+        # Параметры масштабируются под СУММАРНУЮ GPU-память
+        if total_gpu_mem >= 20:     # 2x RTX 4070 = 24 GB / A100 / etc.
             MAX_EPOCHS = 50
-            BATCH_SIZE = 4
+            BATCH_SIZE = 4 * num_gpus   # 4 на каждый GPU
             PATCH_SIZE = (128, 128, 128)
             NUM_SAMPLES = 4
-            NUM_WORKERS = 8
+            NUM_WORKERS = 4 * num_gpus  # 4 воркера на GPU
             CHANNELS = (32, 64, 128, 256, 512)
             STRIDES = (2, 2, 2, 2)
-        elif gpu_mem >= 8:      # RTX 3060-3080 / RTX 4060-4070
+        elif total_gpu_mem >= 8:
             MAX_EPOCHS = 30
-            BATCH_SIZE = 2
+            BATCH_SIZE = 2 * num_gpus
             PATCH_SIZE = (96, 96, 96)
             NUM_SAMPLES = 4
-            NUM_WORKERS = 4
+            NUM_WORKERS = 4 * num_gpus
             CHANNELS = (16, 32, 64, 128, 256)
             STRIDES = (2, 2, 2, 2)
-        else:                   # GTX 1060-1080 / RTX 2060
+        else:
             MAX_EPOCHS = 20
-            BATCH_SIZE = 1
+            BATCH_SIZE = 1 * num_gpus
             PATCH_SIZE = (64, 64, 64)
             NUM_SAMPLES = 2
             NUM_WORKERS = 4
             CHANNELS = (16, 32, 64, 128)
             STRIDES = (2, 2, 2)
 
-    print(f"Устройство: {device}")
+    print(f"Устройство: {device} (GPU: {num_gpus})")
     print(f"Патчи: {PATCH_SIZE}, Batch: {BATCH_SIZE}, Эпохи: {MAX_EPOCHS}")
 
     # =========================================================================
@@ -177,10 +185,17 @@ def main():
     ])
 
     # =========================================================================
-    # ДАТАСЕТЫ И ЛОАДЕРЫ
+    # ДАТАСЕТЫ И ЛОАДЕРЫ — CacheDataset кэширует снимки в RAM
     # =========================================================================
-    train_ds = Dataset(data=train_dicts, transform=train_transforms)
-    val_ds = Dataset(data=val_dicts, transform=val_transforms)
+    print("Кэширование данных в RAM (первый запуск может занять несколько минут)...")
+    train_ds = CacheDataset(
+        data=train_dicts, transform=train_transforms,
+        cache_rate=1.0, num_workers=NUM_WORKERS,
+    )
+    val_ds = CacheDataset(
+        data=val_dicts, transform=val_transforms,
+        cache_rate=1.0, num_workers=NUM_WORKERS,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -190,6 +205,7 @@ def main():
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=3 if NUM_WORKERS > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -198,6 +214,7 @@ def main():
         num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=3 if NUM_WORKERS > 0 else None,
     )
 
     # =========================================================================
@@ -216,9 +233,14 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Модель: 3D U-Net, параметров: {total_params:,}")
 
+    # Multi-GPU: DataParallel
+    if torch.cuda.is_available() and num_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"✓  DataParallel: модель на {num_gpus} GPU")
+
     # Loss и Optimizer
     loss_function = DiceLoss(to_onehot_y=True, softmax=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * num_gpus, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
     dice_metric = DiceMetric(include_background=False, reduction="mean")
 
@@ -271,6 +293,8 @@ def main():
 
         # === VALIDATION ===
         model.eval()
+        # Для sliding_window нужна базовая модель (без DataParallel)
+        raw_model = model.module if hasattr(model, 'module') else model
         with torch.no_grad():
             for val_data in val_loader:
                 val_inputs = val_data["image"].to(device, non_blocking=True)
@@ -278,7 +302,7 @@ def main():
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     val_outputs = sliding_window_inference(
-                        val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=model,
+                        val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
                     )
 
                 val_outputs_onehot = torch.argmax(val_outputs, dim=1, keepdim=True)
@@ -296,9 +320,11 @@ def main():
         # Сохраняем лучшую модель
         if metric > best_metric:
             best_metric = metric
+            # Сохраняем без обёртки DataParallel
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
             torch.save({
                 "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_dice": best_metric,
             }, MODEL_SAVE_PATH)
@@ -317,8 +343,9 @@ def main():
     print(f"Модель сохранена: {MODEL_SAVE_PATH}")
 
     if torch.cuda.is_available():
-        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        print(f"Пик GPU памяти: {peak_mem:.2f} GB")
+        for i in range(torch.cuda.device_count()):
+            peak_mem = torch.cuda.max_memory_allocated(i) / (1024 ** 3)
+            print(f"Пик GPU {i} памяти: {peak_mem:.2f} GB")
 
     print(f"{'='*60}")
 
