@@ -43,6 +43,7 @@ def main():
     MODEL_SAVE_PATH = os.path.join(BASE_DIR, "luna16_unet.pth")
 
     LEARNING_RATE = 1e-4
+    VAL_INTERVAL = 2   # Валидация каждые N эпох (sliding_window — дорогая операция)
 
     # =========================================================================
     # УСТРОЙСТВО — CUDA первым приоритетом
@@ -53,6 +54,7 @@ def main():
         num_gpus = 0
         MAX_EPOCHS = 3
         BATCH_SIZE = 1
+        ACCUM_STEPS = 1
         PATCH_SIZE = (64, 64, 64)
         NUM_SAMPLES = 2
         NUM_WORKERS = 0
@@ -76,15 +78,17 @@ def main():
         # Параметры масштабируются под СУММАРНУЮ GPU-память
         if total_gpu_mem >= 20:     # 2x RTX 4070 = 24 GB / A100 / etc.
             MAX_EPOCHS = 50
-            BATCH_SIZE = 4 * num_gpus   # 4 на каждый GPU
+            BATCH_SIZE = 3 * num_gpus   # 3 на GPU — ~8-9ГБ из 11.6ГБ, с запасом
+            ACCUM_STEPS = 1             # Без accumulation
             PATCH_SIZE = (128, 128, 128)
             NUM_SAMPLES = 4
-            NUM_WORKERS = 4              # Ограничиваем воркеры чтобы не дублировать кеш в RAM
+            NUM_WORKERS = 4
             CHANNELS = (32, 64, 128, 256, 512)
             STRIDES = (2, 2, 2, 2)
         elif total_gpu_mem >= 8:
             MAX_EPOCHS = 30
             BATCH_SIZE = 2 * num_gpus
+            ACCUM_STEPS = 1
             PATCH_SIZE = (96, 96, 96)
             NUM_SAMPLES = 4
             NUM_WORKERS = 4
@@ -93,6 +97,7 @@ def main():
         else:
             MAX_EPOCHS = 20
             BATCH_SIZE = 1 * num_gpus
+            ACCUM_STEPS = 1
             PATCH_SIZE = (64, 64, 64)
             NUM_SAMPLES = 2
             NUM_WORKERS = 4
@@ -100,7 +105,7 @@ def main():
             STRIDES = (2, 2, 2)
 
     print(f"Устройство: {device} (GPU: {num_gpus})")
-    print(f"Патчи: {PATCH_SIZE}, Batch: {BATCH_SIZE}, Эпохи: {MAX_EPOCHS}")
+    print(f"Патчи: {PATCH_SIZE}, Batch: {BATCH_SIZE}x{ACCUM_STEPS}accum={BATCH_SIZE*ACCUM_STEPS}eff, Эпохи: {MAX_EPOCHS}")
 
     # =========================================================================
     # СБОР ДАННЫХ — автоматический поиск всех subset* папок в data/
@@ -256,6 +261,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Начинаем обучение: {MAX_EPOCHS} эпох")
+    print(f"Валидация каждые {VAL_INTERVAL} эпох")
     print(f"Mixed Precision (AMP): {'Да' if use_amp else 'Нет'}")
     print(f"{'='*60}\n")
 
@@ -282,6 +288,7 @@ def main():
         epoch_loss = 0.0
         step = 0
 
+        optimizer.zero_grad(set_to_none=True)
         train_pbar = tqdm(train_loader, desc=f"[Train {epoch+1}/{MAX_EPOCHS}]",
                           unit="batch", leave=True, dynamic_ncols=True)
         for batch_data in train_pbar:
@@ -289,65 +296,78 @@ def main():
             inputs = batch_data["image"].to(device, non_blocking=True)
             labels = batch_data["label"].to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = model(inputs)
                 loss = loss_function(outputs, labels)
+                loss = loss / ACCUM_STEPS  # Нормализация для gradient accumulation
 
             scaler.scale(loss).backward()
+
+            if step % ACCUM_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += loss.item() * ACCUM_STEPS  # Реальный loss (без нормализации)
+            avg_so_far = epoch_loss / step
+            train_pbar.set_postfix(loss=f"{loss.item()*ACCUM_STEPS:.4f}", avg=f"{avg_so_far:.4f}")
+
+        # Flush остатка gradient accumulation
+        if step % ACCUM_STEPS != 0:
             scaler.step(optimizer)
             scaler.update()
-
-            epoch_loss += loss.item()
-            avg_so_far = epoch_loss / step
-            train_pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_so_far:.4f}")
+            optimizer.zero_grad(set_to_none=True)
 
         avg_loss = epoch_loss / max(step, 1)
         scheduler.step()
         lr_now = optimizer.param_groups[0]['lr']
 
-        # === VALIDATION ===
-        model.eval()
-        # Для sliding_window нужна базовая модель (без DataParallel)
-        raw_model = model.module if hasattr(model, 'module') else model
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"[Val   {epoch+1}/{MAX_EPOCHS}]",
-                            unit="scan", leave=True, dynamic_ncols=True)
-            for val_data in val_pbar:
-                val_inputs = val_data["image"].to(device, non_blocking=True)
-                val_labels = val_data["label"].to(device, non_blocking=True)
+        # === VALIDATION (каждые VAL_INTERVAL эпох) ===
+        metric = -1.0
+        if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == MAX_EPOCHS:
+            model.eval()
+            # Для sliding_window нужна базовая модель (без DataParallel)
+            raw_model = model.module if hasattr(model, 'module') else model
+            with torch.no_grad():
+                val_pbar = tqdm(val_loader, desc=f"[Val   {epoch+1}/{MAX_EPOCHS}]",
+                                unit="scan", leave=True, dynamic_ncols=True)
+                for val_data in val_pbar:
+                    val_inputs = val_data["image"].to(device, non_blocking=True)
+                    val_labels = val_data["label"].to(device, non_blocking=True)
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    val_outputs = sliding_window_inference(
-                        val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
-                    )
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        val_outputs = sliding_window_inference(
+                            val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
+                        )
 
-                val_outputs_onehot = torch.argmax(val_outputs, dim=1, keepdim=True)
-                val_labels_onehot = (val_labels > 0).long()
-                dice_metric(y_pred=val_outputs_onehot, y=val_labels_onehot)
+                    val_outputs_onehot = torch.argmax(val_outputs, dim=1, keepdim=True)
+                    val_labels_onehot = (val_labels > 0).long()
+                    dice_metric(y_pred=val_outputs_onehot, y=val_labels_onehot)
 
-            metric = dice_metric.aggregate().item()
-            dice_metric.reset()
+                metric = dice_metric.aggregate().item()
+                dice_metric.reset()
 
-        elapsed = time.time() - epoch_start
+            elapsed = time.time() - epoch_start
+            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
+                  f"Loss={avg_loss:.4f} | Dice={metric:.4f} | "
+                  f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
 
-        print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
-              f"Loss={avg_loss:.4f} | Dice={metric:.4f} | "
-              f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
-
-        # Сохраняем лучшую модель
-        if metric > best_metric:
-            best_metric = metric
-            # Сохраняем без обёртки DataParallel
-            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": state_dict,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_dice": best_metric,
-            }, MODEL_SAVE_PATH)
-            print(f"  ★ Лучшая модель сохранена (Dice: {best_metric:.4f})")
+            # Сохраняем лучшую модель
+            if metric > best_metric:
+                best_metric = metric
+                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": state_dict,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_dice": best_metric,
+                }, MODEL_SAVE_PATH)
+                print(f"  ★ Лучшая модель сохранена (Dice: {best_metric:.4f})")
+        else:
+            elapsed = time.time() - epoch_start
+            print(f"\n  >> Эпоха {epoch+1}/{MAX_EPOCHS} завершена: "
+                  f"Loss={avg_loss:.4f} | Val: пропущена (след. на эпохе {((epoch+1)//VAL_INTERVAL+1)*VAL_INTERVAL}) | "
+                  f"LR={lr_now:.2e} | Время эпохи: {elapsed:.1f}с")
 
         # Очистка GPU-кэша
         if torch.cuda.is_available():
