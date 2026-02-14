@@ -80,17 +80,27 @@ def main():
             total_gpu_mem += mem
             print(f"✓  GPU {i}: {name} ({mem:.1f} GB)")
 
-        # Параметры масштабируются под СУММАРНУЮ GPU-память
-        if total_gpu_mem >= 20:     # 2x RTX 4070 = 24 GB / A100 / etc.
+        # Параметры масштабируются под ПАМЯТЬ ОДНОЙ GPU (DataParallel!)
+        per_gpu_mem = total_gpu_mem / num_gpus
+        if per_gpu_mem >= 20:       # A100 40/80GB, RTX 3090 24GB etc.
             MAX_EPOCHS = 80
-            BATCH_SIZE = 1 * num_gpus   # 1 на GPU — безопасно для 12ГБ карт
-            ACCUM_STEPS = 4             # Эффективный batch = 4*num_gpus
+            BATCH_SIZE = 2 * num_gpus
+            ACCUM_STEPS = 2
             PATCH_SIZE = (128, 128, 128)
             NUM_SAMPLES = 6
             NUM_WORKERS = 4
             CHANNELS = (32, 64, 128, 256, 512)
             STRIDES = (2, 2, 2, 2)
-        elif total_gpu_mem >= 8:
+        elif per_gpu_mem >= 10:     # RTX 4070 12GB, RTX 2080Ti 11GB
+            MAX_EPOCHS = 80
+            BATCH_SIZE = 1 * num_gpus   # 1 на GPU для 12ГБ
+            ACCUM_STEPS = 4             # Эффективный batch = 4*num_gpus
+            PATCH_SIZE = (96, 96, 96)   # 96³ вместо 128³ — экономит ~2.4x
+            NUM_SAMPLES = 6
+            NUM_WORKERS = 4
+            CHANNELS = (32, 64, 128, 256)   # 4 уровня вместо 5
+            STRIDES = (2, 2, 2)
+        elif per_gpu_mem >= 6:      # RTX 3060 8GB и т.д.
             MAX_EPOCHS = 60
             BATCH_SIZE = 1
             ACCUM_STEPS = 2
@@ -339,13 +349,15 @@ def main():
 
                 scaler.scale(loss).backward()
             except RuntimeError as e:
-                if "out of memory" in str(e) or "illegal memory access" in str(e):
+                if "out of memory" in str(e):
                     print(f"\n⚠ GPU OOM на шаге {step}, пропускаем батч")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    del inputs, labels
+                    if 'outputs' in dir(): del outputs
+                    if 'loss' in dir(): del loss
+                    torch.cuda.empty_cache()
                     optimizer.zero_grad(set_to_none=True)
                     continue
-                raise
+                raise  # "illegal memory access" — не восстановить, пусть падает
 
             if step % ACCUM_STEPS == 0:
                 scaler.step(optimizer)
