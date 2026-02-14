@@ -83,8 +83,8 @@ def main():
         # Параметры масштабируются под СУММАРНУЮ GPU-память
         if total_gpu_mem >= 20:     # 2x RTX 4070 = 24 GB / A100 / etc.
             MAX_EPOCHS = 80
-            BATCH_SIZE = 3 * num_gpus   # 3 на GPU — ~8-9ГБ из 11.6ГБ, с запасом
-            ACCUM_STEPS = 1             # Без accumulation
+            BATCH_SIZE = 1 * num_gpus   # 1 на GPU — безопасно для 12ГБ карт
+            ACCUM_STEPS = 4             # Эффективный batch = 4*num_gpus
             PATCH_SIZE = (128, 128, 128)
             NUM_SAMPLES = 6
             NUM_WORKERS = 4
@@ -331,12 +331,21 @@ def main():
             inputs = batch_data["image"].to(device, non_blocking=True)
             labels = batch_data["label"].to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                outputs = model(inputs)
-                loss = loss_function(outputs, labels)
-                loss = loss / ACCUM_STEPS  # Нормализация для gradient accumulation
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    outputs = model(inputs)
+                    loss = loss_function(outputs, labels)
+                    loss = loss / ACCUM_STEPS  # Нормализация для gradient accumulation
 
-            scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "illegal memory access" in str(e):
+                    print(f"\n⚠ GPU OOM на шаге {step}, пропускаем батч")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                raise
 
             if step % ACCUM_STEPS == 0:
                 scaler.step(optimizer)
