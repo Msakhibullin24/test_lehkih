@@ -15,6 +15,7 @@
 """
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import glob
 import time
 import torch
@@ -25,6 +26,7 @@ from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged,
     Spacingd, SpatialPadd, RandCropByPosNegLabeld, RandFlipd, RandRotate90d,
     RandGaussianNoised, RandScaleIntensityd, RandShiftIntensityd,
+    Lambdad,
 )
 import SimpleITK as sitk
 import itk  # noqa: F401 — нужен для MONAI ITKReader
@@ -90,10 +92,10 @@ def main():
             STRIDES = (2, 2, 2, 2)
         elif total_gpu_mem >= 8:
             MAX_EPOCHS = 60
-            BATCH_SIZE = 2 * num_gpus
-            ACCUM_STEPS = 1
+            BATCH_SIZE = 1
+            ACCUM_STEPS = 2
             PATCH_SIZE = (96, 96, 96)
-            NUM_SAMPLES = 6
+            NUM_SAMPLES = 4
             NUM_WORKERS = 4
             CHANNELS = (16, 32, 64, 128, 256)
             STRIDES = (2, 2, 2, 2)
@@ -172,6 +174,10 @@ def main():
             clip=True,
         ),
 
+        # Бинаризация маски после ресамплинга (интерполяция может
+        # превратить 1→0.7 и мелкие узелки теряются)
+        Lambdad(keys=["label"], func=lambda x: (x > 0.5).float()),
+
         # Паддинг до минимального размера патча (если скан меньше)
         SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
 
@@ -210,6 +216,7 @@ def main():
             b_min=0.0, b_max=1.0,
             clip=True,
         ),
+        Lambdad(keys=["label"], func=lambda x: (x > 0.5).float()),
     ])
 
     # =========================================================================
@@ -364,7 +371,7 @@ def main():
 
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         val_outputs = sliding_window_inference(
-                            val_inputs, PATCH_SIZE, sw_batch_size=4, predictor=raw_model,
+                            val_inputs, PATCH_SIZE, sw_batch_size=2, predictor=raw_model,
                         )
 
                     # One-hot предсказания для DiceMetric
